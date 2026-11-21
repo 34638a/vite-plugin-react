@@ -1,0 +1,15 @@
+{
+  "include": ["src", "types", "tests"],
+  "compilerOptions": {
+    "target": "es2023",
+    "module": "preserve",
+    "moduleResolution": "bundler",
+    "lib": ["es2023", "dom", "dom.iterable"],
+    "jsx": "react-jsx",
+    "types": ["node"],
+    "strict": true,
+    "noEmit": true,
+    "noUnusedLocals": true,
+    "skipLibCheck": true
+  }
+}
