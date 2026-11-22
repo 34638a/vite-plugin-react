@@ -7,7 +7,7 @@
  * a page only downloads the code for islands that actually appear on it.
  */
 import { createElement, type ComponentType } from 'react'
-import { createRoot, hydrateRoot } from 'react-dom/client'
+import { createRoot, hydrateRoot, type Root } from 'react-dom/client'
 
 export type IslandRegistry = Record<
   string,
@@ -16,7 +16,14 @@ export type IslandRegistry = Record<
 
 const MARKER = 'vite-island'
 
-/** Hydrates (or renders) one marker element. Never throws. */
+/**
+ * Hydrates (or renders) one marker element. Never throws.
+ *
+ * The marker's `data-state` is `pending` (set by the server for a
+ * client-rendered island) until the island is mounted, then `ready`. A failure
+ * is logged and shown by nothing here: the placeholder stays, and what an
+ * island displays when it breaks is the component's own business.
+ */
 async function mountIsland(el: HTMLElement, registry: IslandRegistry) {
   const { island: id, export: exportName = 'default', hydrate } = el.dataset
   const load = id ? registry[id] : undefined
@@ -29,29 +36,48 @@ async function mountIsland(el: HTMLElement, registry: IslandRegistry) {
     return
   }
 
+  let root: Root | undefined
+  // One broken island must not take down the others on the page.
+  const report = (what: string, error: unknown) =>
+    console.error(`[islands] ${what} "${id}" (${exportName})`, error)
+
   try {
     const mod = await load()
     const Component = mod[exportName] as ComponentType<any> | undefined
     if (!Component) {
       throw new Error(`module for island "${id}" has no export "${exportName}"`)
     }
-    const props = el.dataset.props ? JSON.parse(el.dataset.props) : {}
-    const element = createElement(Component, props)
-
-    if (hydrate === 'ssr') {
-      // Server markup exists inside the marker: attach to it.
-      hydrateRoot(el, element)
-    } else {
-      // Client-only island: marker is empty, render from scratch.
-      createRoot(el).render(element)
+    const start = (mode: string | undefined): Root => {
+      const props = el.dataset.props ? JSON.parse(el.dataset.props) : {}
+      const element = createElement(Component, props)
+      if (mode === 'ssr') {
+        // Server markup exists inside the marker: attach to it.
+        return hydrateRoot(el, element)
+      }
+      // Client-only island: marker holds only fallback content, render over it.
+      const created = createRoot(el)
+      created.render(element)
+      return created
     }
+
+    root = start(hydrate)
     el.setAttribute('data-hydrated', '')
+    el.setAttribute('data-state', 'ready')
+
+    // New props (the marker's HTML was replaced or patched in place) restart
+    // the island with fresh state. Any server markup is stale by then, so the
+    // restart always renders on the client.
+    new MutationObserver(() => {
+      try {
+        root?.unmount()
+        root = start('client')
+        el.setAttribute('data-state', 'ready')
+      } catch (error) {
+        report('failed to restart island', error)
+      }
+    }).observe(el, { attributes: true, attributeFilter: ['data-props'] })
   } catch (error) {
-    // One broken island must not take down the others on the page.
-    console.error(
-      `[islands] failed to mount island "${id}" (${exportName})`,
-      error,
-    )
+    report('failed to mount island', error)
   }
 }
 

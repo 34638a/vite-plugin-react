@@ -39,6 +39,7 @@ import {
   type ResolvedConfig,
   type ViteDevServer,
 } from 'vite'
+import { rewriteRefreshSelfImport } from './refresh'
 import { islandId, scanIslands } from './scan'
 
 export interface IslandsOptions {
@@ -58,12 +59,23 @@ export interface IslandsOptions {
    * @param file absolute path of the `"use client"` module
    */
   clientOnly?: (file: string) => boolean
+  /**
+   * Module specifier whose default export is a `TokenEncoder`
+   * (`{ isToken, encode }`). Lets a host pass props that are placeholders
+   * resolved later (e.g. template expressions): they are spliced into
+   * `data-props` via `encode`, and an island with such a prop renders on the
+   * client only, since the server has no value to render.
+   */
+  tokenEncoder?: string
 }
 
 const PKG = '@vitejs/plugin-islands'
 const VIRTUAL_REGISTRY = 'virtual:islands/registry'
 const VIRTUAL_CLIENT = 'virtual:islands/client'
 const RESOLVED = (id: string) => '\0' + id
+const REACT_PREAMBLE = '@vitejs/plugin-react/preamble'
+const hasReactPreamble = (config: ResolvedConfig) =>
+  config.plugins.some((p) => p.name === 'vite:react-virtual-preamble')
 
 /** Removes `?v=hash` / `?import` style queries that Vite appends in dev. */
 const cleanUrl = (id: string) => id.replace(/[?#].*$/s, '')
@@ -178,6 +190,13 @@ export function islands(options: IslandsOptions = {}): Plugin[] {
         if (id === RESOLVED(VIRTUAL_CLIENT)) {
           // Side-effect entry: importing it is enough to hydrate the page.
           return [
+            // Fast Refresh needs its hook installed before react-dom loads, and
+            // host pages (e.g. Stencil's) have no index.html carrying it, so the
+            // entry installs it first. Only when plugin-react is present (it
+            // serves the module, empty outside dev).
+            ...(config.command === 'serve' && hasReactPreamble(config)
+              ? [`import ${JSON.stringify(REACT_PREAMBLE)}`]
+              : []),
             `import registry from ${JSON.stringify(VIRTUAL_REGISTRY)}`,
             `import { hydrateIslands } from ${JSON.stringify(PKG + '/runtime/client')}`,
             `export { hydrateIslands, registry }`,
@@ -228,15 +247,40 @@ export function islands(options: IslandsOptions = {}): Plugin[] {
           const hydrate = !options.clientOnly?.(file)
           const result = transformWrapExport(code, ast, {
             runtime: (value, name) =>
-              `$$islands.wrap(${value}, ${JSON.stringify(id)}, ${JSON.stringify(name)}, ${hydrate})`,
+              `$$islands.wrap(${value}, ${JSON.stringify(id)}, ${JSON.stringify(name)}, ${hydrate}${options.tokenEncoder ? ', $$tokenEncoder' : ''})`,
           })
           result.output.prepend(
-            `import * as $$islands from ${JSON.stringify(PKG + '/runtime/server')};\n`,
+            `import * as $$islands from ${JSON.stringify(PKG + '/runtime/server')};\n` +
+              (options.tokenEncoder
+                ? `import $$tokenEncoder from ${JSON.stringify(options.tokenEncoder)};\n`
+                : ''),
           )
           return {
             code: result.output.toString(),
             map: result.output.generateMap({ hires: 'boundary', source: file }),
           }
+        },
+      },
+    },
+
+    {
+      // DEV: Fast Refresh's self-import must not use a root-relative URL (see
+      // ./refresh). Runs after plugin-react's wrapper has added it.
+      name: 'islands:refresh-self-import',
+      apply: 'serve',
+      transform: {
+        order: 'post',
+        filter: { code: '__vite_react_currentExports' },
+        async handler(code, rawId) {
+          if (isServer(this.environment)) return
+          const file = cleanUrl(rawId)
+          await ensureScanned()
+          if (![...registry.values()].includes(file)) return
+          const out = rewriteRefreshSelfImport(
+            code,
+            file.split(path.sep).join('/'),
+          )
+          return out === code ? undefined : { code: out, map: null }
         },
       },
     },

@@ -66,6 +66,17 @@ function isComponent(value: unknown, exportName: string): boolean {
 }
 
 /**
+ * Host-supplied handling for props that are not JSON but a placeholder the
+ * host resolves later (e.g. a template expression). Passed to `wrap` by the
+ * generated code from the `tokenEncoder` plugin option.
+ */
+export interface TokenEncoder {
+  isToken(value: unknown): boolean
+  /** Text spliced into `data-props` where the token sits (a JSON fragment). */
+  encode(value: any): string
+}
+
+/**
  * Serializes props for the `data-props` attribute.
  *
  * Props cross a process boundary (server -> HTML -> browser), so only JSON
@@ -79,6 +90,7 @@ function isComponent(value: unknown, exportName: string): boolean {
 export function serializeProps(
   props: Record<string, unknown>,
   label: string,
+  encoder?: TokenEncoder,
 ): string {
   if (props.children != null) {
     throw new Error(
@@ -87,36 +99,128 @@ export function serializeProps(
         `yet. Pass data as props instead.`,
     )
   }
-  return JSON.stringify(props, (key, value) => {
-    const type = typeof value
-    if (type === 'function' || type === 'symbol' || type === 'bigint') {
-      throw new Error(
-        `[islands] <${label}> prop \`${key}\` is a ${type}, which cannot be ` +
-          `serialized for hydration. Island props must be JSON-compatible.`,
-      )
+  // Tokens cannot be JSON; each is swapped for a sentinel string, then the
+  // quoted sentinel is replaced by the host's encoding of that token.
+  const tokens: string[] = []
+  // Random per call so user data cannot collide with it.
+  const SENTINEL = `island-token-${Math.random().toString(36).slice(2)}:`
+  // Done before stringify: JSON.stringify calls `toJSON` ahead of the
+  // replacer, and a token's `toJSON` may throw.
+  const swap = (value: unknown): unknown => {
+    if (!encoder) return value
+    if (encoder.isToken(value)) {
+      tokens.push(encoder.encode(value))
+      return `${SENTINEL}${tokens.length - 1}`
     }
-    if (type === 'object' && value != null) {
-      if ('$$typeof' in value) {
-        throw new Error(
-          `[islands] <${label}> prop \`${key}\` is a React element, which ` +
-            `cannot be serialized for hydration.`,
-        )
-      }
+    if (Array.isArray(value)) return value.map(swap)
+    if (typeof value === 'object' && value != null) {
       const proto = Object.getPrototypeOf(value)
-      if (
-        !Array.isArray(value) &&
-        proto !== Object.prototype &&
-        proto != null
-      ) {
-        throw new Error(
-          `[islands] <${label}> prop \`${key}\` is a class instance ` +
-            `(${proto?.constructor?.name}); only plain objects and arrays ` +
-            `can be serialized for hydration.`,
+      if (proto === Object.prototype || proto == null) {
+        return Object.fromEntries(
+          Object.entries(value).map(([k, v]) => [k, swap(v)]),
         )
       }
     }
     return value
-  })
+  }
+  let json: string
+  try {
+    json = JSON.stringify(swap(props), (key, value) => {
+      const type = typeof value
+      if (type === 'function' || type === 'symbol' || type === 'bigint') {
+        throw new Error(
+          `[islands] <${label}> prop \`${key}\` is a ${type}, which cannot be ` +
+            `serialized for hydration. Island props must be JSON-compatible.`,
+        )
+      }
+      if (type === 'object' && value != null) {
+        if ('$$typeof' in value) {
+          throw new Error(
+            `[islands] <${label}> prop \`${key}\` is a React element, which ` +
+              `cannot be serialized for hydration.`,
+          )
+        }
+        const proto = Object.getPrototypeOf(value)
+        if (
+          !Array.isArray(value) &&
+          proto !== Object.prototype &&
+          proto != null
+        ) {
+          throw new Error(
+            `[islands] <${label}> prop \`${key}\` is a class instance ` +
+              `(${proto?.constructor?.name}); only plain objects and arrays ` +
+              `can be serialized for hydration.`,
+          )
+        }
+      }
+      return value
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (message.startsWith('[islands]')) throw error
+    throw new Error(
+      `[islands] <${label}> props could not be serialized: ${message}`,
+    )
+  }
+  return tokens.length
+    ? json.replace(
+        new RegExp(`"${SENTINEL}(\\d+)"(\\}?)`, 'g'),
+        // A space keeps a closing `}` off the end of the token: a template
+        // placeholder like `{{x}}` followed by `}` would lex as `}}}`.
+        (_m, i, brace) => tokens[+i]! + (brace ? ' }' : ''),
+      )
+    : json
+}
+
+/**
+ * Content for the two situations in which a client-rendered island's marker
+ * would otherwise be empty (the server has no component markup to put there):
+ *
+ *  - `placeholder`: the island has not begun to render. It holds the marker's
+ *    place if the viewport sees it before the island's code has loaded. React
+ *    clears the marker's children when the island mounts, so nothing has to
+ *    remove it.
+ *  - `noscript`: scripts are off, so the island will never render.
+ *
+ * What an island shows when it fails is the component's own business (an error
+ * boundary of its own); the plugin adds no failed state.
+ *
+ * A server-rendered island already has its real markup, so it takes none.
+ */
+export interface IslandFallback {
+  placeholder?: ReactNode
+  noscript?: ReactNode
+}
+
+function fallbackNodes(fallback: IslandFallback | undefined): ReactNode {
+  if (!fallback) return null
+  const { placeholder, noscript } = fallback
+  return [
+    placeholder != null &&
+      createElement(
+        'span',
+        {
+          key: 'placeholder',
+          'data-island-placeholder': '',
+          style: { display: 'contents' },
+        },
+        placeholder,
+      ),
+    noscript != null &&
+      createElement('noscript', { key: 'noscript' }, noscript),
+  ]
+}
+
+function containsToken(value: unknown, encoder: TokenEncoder): boolean {
+  if (encoder.isToken(value)) return true
+  if (Array.isArray(value)) return value.some((v) => containsToken(v, encoder))
+  if (typeof value === 'object' && value != null) {
+    const proto = Object.getPrototypeOf(value)
+    if (proto === Object.prototype || proto == null) {
+      return Object.values(value).some((v) => containsToken(v, encoder))
+    }
+  }
+  return false
 }
 
 /**
@@ -136,6 +240,7 @@ export function wrap<T>(
   id: string,
   exportName: string,
   hydrate: boolean,
+  encoder?: TokenEncoder,
 ): T {
   if (!isComponent(value, exportName)) return value
 
@@ -145,27 +250,37 @@ export function wrap<T>(
       ? (Original.displayName ?? Original.name ?? 'default')
       : exportName
 
-  function Island(props: Record<string, unknown>): ReactNode {
+  function Island(allProps: Record<string, unknown>): ReactNode {
+    const { fallback, ...props } = allProps as {
+      fallback?: IslandFallback
+    } & Record<string, unknown>
     // Nested client component: the outer island already owns this subtree.
     if (useContext(InsideIsland)) return createElement(Original, props)
+
+    // Tokens only have values in the browser, so the server cannot render them.
+    const hasToken =
+      !!encoder && Object.values(props).some((v) => containsToken(v, encoder))
+    const ssr = hydrate && !hasToken
 
     return createElement(
       'vite-island',
       {
         'data-island': id,
         'data-export': exportName,
-        'data-props': serializeProps(props, label),
-        'data-hydrate': hydrate ? 'ssr' : 'client',
+        'data-props': serializeProps(props, label, encoder),
+        'data-hydrate': ssr ? 'ssr' : 'client',
+        // `pending` until the client mounts the island, then `ready`.
+        ...(ssr ? {} : { 'data-state': 'pending' }),
         // The marker is purely structural; keep it out of layout/CSS flow.
         style: { display: 'contents' },
       },
-      hydrate
+      ssr
         ? createElement(
             InsideIsland.Provider,
             { value: true },
             createElement(Original, props),
           )
-        : null,
+        : fallbackNodes(fallback),
     )
   }
   Island.displayName = `Island(${label})`

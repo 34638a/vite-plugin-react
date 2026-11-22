@@ -26,7 +26,13 @@ function fixtureConfig(
     root,
     configFile: false,
     logLevel: 'silent',
-    plugins: [islands(include ? { include } : {})],
+    plugins: [
+      islands({
+        ...(include ? { include } : {}),
+        // These fixtures must render on the client (as a token prop would force).
+        clientOnly: (file) => /(ClientCounter|Exploder)\.tsx$/.test(file),
+      }),
+    ],
     oxc: { jsx: { runtime: 'automatic' } },
     environments: {
       ssr: {
@@ -59,6 +65,7 @@ function fixtureConfig(
 describe('islands pipeline', () => {
   const outDir = 'dist'
   let html: string
+  let fallbackHtml: string
   let server: http.Server
   let origin: string
   let browser: Browser
@@ -67,7 +74,7 @@ describe('islands pipeline', () => {
     // Only the good fixture files: BadIsland is exercised separately.
     const builder = await createBuilder(
       fixtureConfig(outDir, undefined, [
-        'src/{Counter,Panel,Page,entry-ssr}.tsx',
+        'src/{Counter,Panel,Page,entry-ssr,ClientCounter,Exploder,FallbackPage}.tsx',
       ]),
     )
     await builder.buildApp()
@@ -77,6 +84,7 @@ describe('islands pipeline', () => {
       pathToFileURL(path.join(root, outDir, 'ssr/entry.js')).href
     )
     html = ssr.render()
+    fallbackHtml = ssr.renderFallback()
 
     // Serve what Apache would: a static page + the client dist.
     const page = `<!doctype html><html><body><div id="app">${html}</div>
@@ -84,6 +92,14 @@ describe('islands pipeline', () => {
     server = http.createServer((req, res) => {
       if (req.url === '/') {
         res.setHeader('content-type', 'text/html').end(page)
+        return
+      }
+      if (req.url === '/fallback') {
+        res
+          .setHeader('content-type', 'text/html')
+          .end(
+            `<!doctype html><html><body><div id="app">${fallbackHtml}</div><script type="module" src="/main.js"></script></body></html>`,
+          )
         return
       }
       // Browsers auto-request this; a 404 would show up as a console error.
@@ -168,6 +184,112 @@ describe('islands pipeline', () => {
 
     expect(problems).toEqual([])
     await page.close()
+  })
+
+  test('new props on a marker restart the island with fresh state', async () => {
+    const page = await browser.newPage()
+    await page.goto(origin)
+    await page.waitForFunction(
+      () =>
+        document.querySelectorAll('vite-island[data-hydrated]').length === 2,
+    )
+    const top = page.locator('vite-island >> nth=0').locator('#counter')
+    await top.click()
+    await expect(top.textContent()).resolves.toBe('Count: 4')
+
+    await page.evaluate(() =>
+      document
+        .querySelector('vite-island')!
+        .setAttribute('data-props', '{"start":50}'),
+    )
+    await page.waitForFunction(
+      () => document.querySelector('#counter')?.textContent === 'Count: 50',
+    )
+    await top.click()
+    await expect(top.textContent()).resolves.toBe('Count: 51')
+    await page.close()
+  })
+
+  describe('fallback states', () => {
+    const chunk = '**/*ClientCounter*.js'
+
+    test('SSR output: a client-rendered island carries its placeholder and no-JS content', () => {
+      expect(fallbackHtml).toContain('data-state="pending"')
+      expect(fallbackHtml).toContain('id="placeholder-cc"')
+      expect(fallbackHtml).toContain('<noscript><p id="noscript-cc">')
+      expect(fallbackHtml).not.toContain('failed')
+      // Fallback is never part of the props.
+      expect(fallbackHtml).toContain('data-props="{&quot;start&quot;:5}"')
+    })
+
+    test('the placeholder shows until the island mounts, then the island replaces it', async () => {
+      const page = await browser.newPage()
+      await page.route(chunk, async (route) => {
+        await new Promise((r) => setTimeout(r, 800))
+        await route.continue()
+      })
+      await page.goto(origin + '/fallback')
+      await expect(page.locator('#placeholder-cc').isVisible()).resolves.toBe(
+        true,
+      )
+      await expect(
+        page.locator('vite-island >> nth=0').getAttribute('data-state'),
+      ).resolves.toBe('pending')
+      await page.waitForSelector('#client-counter')
+      await expect(page.locator('#placeholder-cc').count()).resolves.toBe(0)
+      await expect(
+        page.locator('vite-island >> nth=0').getAttribute('data-state'),
+      ).resolves.toBe('ready')
+      await page.locator('#client-counter').click()
+      await expect(page.locator('#client-counter').textContent()).resolves.toBe(
+        'Client: 6',
+      )
+      await page.close()
+    })
+
+    test('a module that fails to load is logged and leaves the placeholder, with no failed state of its own', async () => {
+      const page = await browser.newPage()
+      const errors: string[] = []
+      page.on('console', (m) => {
+        if (m.type() === 'error') errors.push(m.text())
+      })
+      await page.route(chunk, (route) => route.abort())
+      await page.goto(origin + '/fallback')
+      await expect
+        .poll(() => errors.some((e) => e.includes('failed to mount island')))
+        .toBe(true)
+      await expect(page.locator('#placeholder-cc').isVisible()).resolves.toBe(
+        true,
+      )
+      await expect(
+        page.locator('vite-island >> nth=0').getAttribute('data-state'),
+      ).resolves.toBe('pending')
+      await page.close()
+    })
+
+    test('an island that handles its own render failure shows its own message', async () => {
+      const page = await browser.newPage()
+      page.on('console', () => {}) // React logs the caught error
+      await page.goto(origin + '/fallback')
+      await page.waitForSelector('#own-failure')
+      await expect(page.locator('#placeholder-ex').count()).resolves.toBe(0)
+      await expect(
+        page.locator('vite-island >> nth=1').getAttribute('data-state'),
+      ).resolves.toBe('ready')
+      // The sibling island is unaffected.
+      await expect(page.locator('#client-counter').isVisible()).resolves.toBe(
+        true,
+      )
+      await page.close()
+    })
+
+    test('with JavaScript off, the no-JS content is shown', async () => {
+      const context = await browser.newContext({ javaScriptEnabled: false })
+      const page = await context.newPage()
+      await page.goto(origin + '/fallback')
+      await expect(page.locator('#noscript-cc').isVisible()).resolves.toBe(true)
+      await context.close()
+    })
   })
 })
 

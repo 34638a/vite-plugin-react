@@ -76,11 +76,51 @@ marker.
 
 ## Options
 
-| Option       | Default                        | Purpose                                                                                                                                                                 |
-| ------------ | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `include`    | `['src/**/*.{js,jsx,ts,tsx}']` | Where to look for `"use client"` modules. Only matched files can hydrate (the client registry comes from this scan, so client build doesn't depend on SSR build order). |
-| `exclude`    | node_modules, `.d.ts`, tests   | Ignored paths.                                                                                                                                                          |
-| `clientOnly` | none                           | `(file) => boolean`. Skip SSR for islands that touch `window` while rendering; client renders them from scratch.                                                        |
+| Option         | Default                        | Purpose                                                                                                                                                                                                                                                                    |
+| -------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `include`      | `['src/**/*.{js,jsx,ts,tsx}']` | Where to look for `"use client"` modules. Only matched files can hydrate (the client registry comes from this scan, so client build doesn't depend on SSR build order).                                                                                                    |
+| `exclude`      | node_modules, `.d.ts`, tests   | Ignored paths.                                                                                                                                                                                                                                                             |
+| `clientOnly`   | none                           | `(file) => boolean`. Skip SSR for islands that touch `window` while rendering; client renders them from scratch.                                                                                                                                                           |
+| `tokenEncoder` | none                           | Module specifier whose default export is `{ isToken(v), encode(v) }`. A host (e.g. a template engine) passes props that are placeholders resolved later; `encode` returns the JSON fragment spliced into `data-props`. An island with such a prop is client-rendered only. |
+
+## Placeholder and no-JS content (`fallback`)
+
+A client-rendered island (one with a token prop, or listed in `clientOnly`) has
+no component markup on the server, so its marker would be empty until the island
+mounts. Pass the reserved `fallback` prop to fill it:
+
+```tsx
+<Widget
+  fallback={{ placeholder: <Skeleton />, noscript: <p>Enable JavaScript</p> }}
+/>
+```
+
+- `placeholder`: "this island has not begun to render yet". It holds the
+  marker's place in case the viewport sees it before the island's code has
+  loaded. React replaces it when the island mounts.
+- `noscript`: "this island will never render, scripts are off". Inside
+  `<noscript>`. The placeholder is still visible with scripts off too; hide it
+  with CSS on `[data-island-placeholder]` if that matters.
+
+There is no failed state. What an island shows when it breaks is the
+component's own business (give it an error boundary). If an island's module
+cannot load, the error is logged and the placeholder stays.
+
+`fallback` is never serialized and never reaches the component. A
+server-rendered island has its real markup already, so it takes none.
+
+The marker's `data-state` is `pending` on a client-rendered island until it
+mounts, then `ready`.
+
+## Development
+
+- **Fast Refresh in place.** In dev the client entry installs
+  `@vitejs/plugin-react`'s refresh preamble (when that plugin is present), so
+  editing an island's code hot-updates it and keeps its state. The plugin also
+  points Fast Refresh's self-import at a `/@fs/` URL, for hosts that answer
+  root-relative `/src/...` URLs themselves.
+- **Restart on new props.** If a marker's `data-props` changes, its island is
+  unmounted and mounted again with fresh state and the new props.
 
 ## Rules and limitations
 
