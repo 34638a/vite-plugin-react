@@ -94,8 +94,16 @@ export function islands(options: IslandsOptions = {}): Plugin[] {
   /** Generates the `id -> dynamic import` table for the browser. */
   function registryModule(): string {
     const rows = [...registry].map(([id, file]) => {
-      // Root-relative specifier when possible: stable across machines and
-      // resolved by Vite exactly like a hand-written import.
+      if (config.command === 'serve') {
+        // Dev: a host that fronts Vite (e.g. a server that owns root-relative
+        // URLs such as `/src/...`) would swallow the normalised import. `/@fs/`
+        // is always Vite's own, but Vite only keeps it when the specifier is
+        // not a literal it can analyse, hence the variable.
+        const url = '/@fs/' + file.split(path.sep).join('/').replace(/^\//, '')
+        return `  ${JSON.stringify(id)}: () => { const url = ${JSON.stringify(url)}; return import(/* @vite-ignore */ url) },`
+      }
+      // Build: root-relative specifier when possible: stable across machines
+      // and resolved by Vite exactly like a hand-written import.
       const rel = path.relative(config.root, file).split(path.sep).join('/')
       const specifier = rel.startsWith('..') ? file : '/' + rel
       return `  ${JSON.stringify(id)}: () => import(${JSON.stringify(specifier)}),`
