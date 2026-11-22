@@ -235,3 +235,43 @@ describe('fallback', () => {
     )
   })
 })
+
+describe('loading conditions (on* props)', () => {
+  const render = async (
+    props: Record<string, unknown>,
+    seen: { props?: unknown } = {},
+  ) => {
+    const { renderToStaticMarkup } = await import('react-dom/server')
+    const C = (p: any) => ((seen.props = p), createElement('b', null, 'x'))
+    const W: any = wrap(C, 'id', 'C', true)
+    return renderToStaticMarkup(createElement(W, props))
+  }
+
+  test('conditions become data-on-* attributes and never reach the component or data-props', async () => {
+    const seen: { props?: unknown } = {}
+    const html = await render(
+      {
+        n: 1,
+        onIdle: true,
+        onVisible: '200px 0px',
+        onAny: true,
+        onSaveData: false,
+      },
+      seen,
+    )
+    expect(html).toContain('data-on-idle=""')
+    expect(html).toContain('data-on-visible="200px 0px"')
+    expect(html).toContain('data-on-any=""')
+    expect(html).toContain('data-on-save-data="false"')
+    expect(html).toContain('data-props="{&quot;n&quot;:1}"')
+    expect(seen.props).toEqual({ n: 1 })
+  })
+
+  test('no on* props means no data-on-* attributes (the client loads it eagerly)', async () => {
+    expect(await render({ n: 1 })).not.toContain('data-on-')
+  })
+
+  test('an invalid condition fails loudly, naming the component and the prop', async () => {
+    await expect(render({ onMedia: true })).rejects.toThrow(/<C>.*onMedia/s)
+  })
+})

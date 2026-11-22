@@ -83,6 +83,52 @@ marker.
 | `clientOnly`   | none                           | `(file) => boolean`. Skip SSR for islands that touch `window` while rendering; client renders them from scratch.                                                                                                                                                           |
 | `tokenEncoder` | none                           | Module specifier whose default export is `{ isToken(v), encode(v) }`. A host (e.g. a template engine) passes props that are placeholders resolved later; `encode` returns the JSON fragment spliced into `data-props`. An island with such a prop is client-rendered only. |
 
+## When an island loads (`on*` props)
+
+Loading conditions are modelled on [`<is-land>`](https://github.com/11ty/is-land)
+and its `on:` attributes. With none, an island loads as soon as the page's
+islands are hydrated. Name conditions with reserved `on*` props; they become
+`data-on-*` attributes on the marker and never reach the component.
+
+| Prop            | Value                                      | The island loads…                                                                                                     |
+| --------------- | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| `onVisible`     | `true`, or a `rootMargin` (`"200px 0px"`)  | when it is on screen (the margin starts it early).                                                                    |
+| `onIdle`        | `true`, or a max wait in ms                | gradually: one island per browser idle slice, in document order, after the page has loaded. A number bounds its wait. |
+| `onLoad`        | `true`                                     | once the page's `load` event has fired.                                                                               |
+| `onInteraction` | `true`, or events (`"mouseenter,focusin"`) | on first interaction with it (default `touchstart,click`). The triggering event is not replayed.                      |
+| `onMedia`       | a media query                              | while the query matches (`"(min-width: 64em)"`, `"(prefers-reduced-motion)"`).                                        |
+| `onSaveData`    | `true` or `false`                          | while Save Data is on (`true`) or off (`false`).                                                                      |
+| `onAny`         | `true`                                     | (a combinator, see below)                                                                                             |
+
+**Several conditions must ALL be satisfied**, as in is-land:
+`<Map onVisible onMedia="(min-width: 64em)" />` loads when it is on screen on a
+wide viewport. Add `onAny` and **any one** is enough:
+
+```tsx
+// Trickle in when idle, but right now if the visitor reaches it first.
+<Chart onIdle onVisible onAny />
+```
+
+The idle queue is shared, so `onIdle` islands start one at a time. An island that
+loads another way (here, by becoming visible) is dropped from the queue and its
+turn is skipped, not wasted.
+
+- `onVisible` and `onInteraction` need content to watch with a layout box: the
+  server markup, or a `fallback.placeholder`. The marker itself is
+  `display: contents` and has none. An island with nothing to watch logs a
+  warning and waits for an idle turn instead.
+- Browsers without `requestIdleCallback` (Safari) fall back to a short timer;
+  each idle slice is otherwise bounded by a 2s timeout so a busy page cannot
+  starve the queue.
+- `onSaveData` without the Network Information API counts as satisfied;
+  `onMedia` without `matchMedia` too.
+- `hydrateIslands()` resolves when the islands with no conditions have mounted;
+  the others are only scheduled by then, since e.g. a visible one may never load.
+- Invalid values (`onMedia` as a boolean, `onIdle="soon"`, …) fail the render,
+  naming the component and the prop.
+- These prop names are reserved on an island call, so a component should not
+  use them for its own props.
+
 ## Placeholder and no-JS content (`fallback`)
 
 A client-rendered island (one with a token prop, or listed in `clientOnly`) has

@@ -9,7 +9,7 @@ import { pathToFileURL } from 'node:url'
  * Requires `pnpm build` first (the fixture consumes the built runtimes, the
  * same way a real app would).
  */
-import { chromium, type Browser } from '@playwright/test'
+import { chromium, type Browser, type Page } from '@playwright/test'
 import { createBuilder, type InlineConfig } from 'vite'
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { islands } from '../src/index'
@@ -66,6 +66,7 @@ describe('islands pipeline', () => {
   const outDir = 'dist'
   let html: string
   let fallbackHtml: string
+  let loadHtml: string
   let server: http.Server
   let origin: string
   let browser: Browser
@@ -74,7 +75,7 @@ describe('islands pipeline', () => {
     // Only the good fixture files: BadIsland is exercised separately.
     const builder = await createBuilder(
       fixtureConfig(outDir, undefined, [
-        'src/{Counter,Panel,Page,entry-ssr,ClientCounter,Exploder,FallbackPage}.tsx',
+        'src/{Counter,Panel,Page,entry-ssr,ClientCounter,Exploder,FallbackPage,Tagged,LoadPage}.tsx',
       ]),
     )
     await builder.buildApp()
@@ -85,6 +86,7 @@ describe('islands pipeline', () => {
     )
     html = ssr.render()
     fallbackHtml = ssr.renderFallback()
+    loadHtml = ssr.renderLoad()
 
     // Serve what Apache would: a static page + the client dist.
     const page = `<!doctype html><html><body><div id="app">${html}</div>
@@ -92,6 +94,14 @@ describe('islands pipeline', () => {
     server = http.createServer((req, res) => {
       if (req.url === '/') {
         res.setHeader('content-type', 'text/html').end(page)
+        return
+      }
+      if (req.url === '/load') {
+        res
+          .setHeader('content-type', 'text/html')
+          .end(
+            `<!doctype html><html><body><div id="app">${loadHtml}</div><script type="module" src="/main.js"></script></body></html>`,
+          )
         return
       }
       if (req.url === '/fallback') {
@@ -208,6 +218,144 @@ describe('islands pipeline', () => {
     await top.click()
     await expect(top.textContent()).resolves.toBe('Count: 51')
     await page.close()
+  })
+
+  describe('loading conditions', () => {
+    const hydrated = (page: Page) =>
+      page.evaluate(() =>
+        [...document.querySelectorAll('vite-island[data-hydrated]')].map(
+          (el) => (el as HTMLElement).querySelector('button')!.dataset.name,
+        ),
+      )
+    // Runs in the page, so it takes the island name as an argument.
+    const isHydrated = (name: string) =>
+      !!document
+        .querySelector(`button[data-name="${name}"]`)
+        ?.closest('vite-island[data-hydrated]')
+    const scrollTo = (page: Page, name: string) =>
+      page.locator(`button[data-name="${name}"]`).scrollIntoViewIfNeeded()
+    /** Idle time only comes when the test says so (one slice per call). */
+    const manualIdle = (page: Page) =>
+      page.addInitScript(() => {
+        const slices: Array<() => void> = []
+        ;(window as any).__slices = slices
+        ;(window as any).requestIdleCallback = (cb: () => void) =>
+          slices.push(cb)
+      })
+    const runSlice = (page: Page) =>
+      page.evaluate(() => (window as any).__slices.shift()())
+    const settle = async (page: Page, count: number) => {
+      await page.waitForFunction(
+        (n) =>
+          document.querySelectorAll('vite-island[data-hydrated]').length === n,
+        count,
+      )
+      await page.waitForTimeout(150) // and nothing more arrives on its own
+      expect((await hydrated(page)).length).toBe(count)
+    }
+
+    test('SSR output: the conditions are data-on-* attributes, not props', () => {
+      expect(loadHtml).toContain('data-on-load=""')
+      expect(loadHtml).toContain('data-on-interaction=""')
+      expect(loadHtml).toContain('data-on-media="(min-width: 5000px)"')
+      expect(loadHtml).toContain('data-on-idle=""')
+      expect(loadHtml).toContain('data-on-visible=""')
+      expect(loadHtml).toContain('data-on-any=""')
+      expect(loadHtml).not.toContain('onVisible')
+    })
+
+    test('with no conditions an island mounts at once; onVisible waits until it is scrolled to', async () => {
+      const page = await browser.newPage()
+      await page.goto(origin + '/load')
+      await page.waitForFunction(isHydrated, 'eager')
+      await page.waitForTimeout(400)
+      expect(await hydrated(page)).not.toContain('visible')
+      await scrollTo(page, 'visible')
+      await page.waitForFunction(isHydrated, 'visible')
+      await page.close()
+    })
+
+    test('onLoad and onIdle load by themselves; the rest wait for what they asked for', async () => {
+      const page = await browser.newPage()
+      await page.goto(origin + '/load')
+      await page.waitForFunction(isHydrated, 'hybrid')
+      await page.waitForFunction(isHydrated, 'idle-2')
+      const names = await hydrated(page)
+      expect(names).toEqual(
+        expect.arrayContaining(['eager', 'load', 'idle-1', 'idle-2', 'hybrid']),
+      )
+      // Nothing scrolled, clicked or resized: these are still waiting.
+      for (const waiting of ['interaction', 'media', 'visible', 'and'])
+        expect(names).not.toContain(waiting)
+      await page.close()
+    })
+
+    test('onInteraction loads on the first click', async () => {
+      const page = await browser.newPage()
+      await page.goto(origin + '/load')
+      await page.waitForFunction(isHydrated, 'eager')
+      await page.waitForTimeout(300)
+      expect(await hydrated(page)).not.toContain('interaction')
+      await page.locator('button[data-name="interaction"]').click()
+      await page.waitForFunction(isHydrated, 'interaction')
+      await page.close()
+    })
+
+    test('onMedia loads once the viewport matches', async () => {
+      const page = await browser.newPage()
+      await page.goto(origin + '/load')
+      await page.waitForFunction(isHydrated, 'eager')
+      await page.waitForTimeout(300)
+      expect(await hydrated(page)).not.toContain('media')
+      await page.setViewportSize({ width: 5200, height: 800 })
+      await page.waitForFunction(isHydrated, 'media')
+      await page.close()
+    })
+
+    test('onIdle is gradual: one island per idle slice, in document order', async () => {
+      const page = await browser.newPage()
+      await manualIdle(page)
+      await page.goto(origin + '/load')
+      await settle(page, 2) // eager and onLoad: no idle time has come yet
+      await runSlice(page)
+      await settle(page, 3)
+      expect(await hydrated(page)).toContain('idle-1')
+      await runSlice(page)
+      await settle(page, 4)
+      expect(await hydrated(page)).toContain('idle-2')
+      await runSlice(page)
+      await settle(page, 5)
+      expect(await hydrated(page)).toContain('hybrid')
+      await page.close()
+    })
+
+    test('onIdle + onVisible + onAny loads right now when scrolled to before its idle turn', async () => {
+      const page = await browser.newPage()
+      await page.addInitScript(() => {
+        ;(window as any).requestIdleCallback = () => 0 // idle time never comes
+      })
+      await page.goto(origin + '/load')
+      await settle(page, 2)
+      await scrollTo(page, 'hybrid')
+      await page.waitForFunction(isHydrated, 'hybrid')
+      // The idle islands are still waiting: visibility loaded only this one.
+      expect(await hydrated(page)).toEqual(['eager', 'load', 'hybrid'])
+      await page.close()
+    })
+
+    test('onIdle + onVisible without onAny needs both: visible alone is not enough', async () => {
+      const page = await browser.newPage()
+      await manualIdle(page)
+      await page.goto(origin + '/load')
+      await settle(page, 2)
+      await scrollTo(page, 'and')
+      await page.waitForTimeout(400)
+      expect(await hydrated(page)).not.toContain('and')
+      // idle-1, idle-2 and hybrid take the first three slices; then it is its turn.
+      for (let n = 0; n < 4; n++) await runSlice(page)
+      await page.waitForFunction(isHydrated, 'and')
+      await page.close()
+    })
   })
 
   describe('fallback states', () => {

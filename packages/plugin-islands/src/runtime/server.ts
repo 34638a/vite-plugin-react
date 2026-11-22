@@ -27,6 +27,7 @@ import {
   type ComponentType,
   type ReactNode,
 } from 'react'
+import { splitOnProps } from './load'
 
 /**
  * True while rendering *inside* an island's server markup.
@@ -251,9 +252,11 @@ export function wrap<T>(
       : exportName
 
   function Island(allProps: Record<string, unknown>): ReactNode {
-    const { fallback, ...props } = allProps as {
+    const { fallback, ...withOn } = allProps as {
       fallback?: IslandFallback
     } & Record<string, unknown>
+    // The loading conditions (onVisible, onIdle, ...) are for the marker, not the component.
+    const { rest: props, attrs: onAttrs } = splitOnProps(withOn, label)
     // Nested client component: the outer island already owns this subtree.
     if (useContext(InsideIsland)) return createElement(Original, props)
 
@@ -269,6 +272,7 @@ export function wrap<T>(
         'data-export': exportName,
         'data-props': serializeProps(props, label, encoder),
         'data-hydrate': ssr ? 'ssr' : 'client',
+        ...onAttrs,
         // `pending` until the client mounts the island, then `ready`.
         ...(ssr ? {} : { 'data-state': 'pending' }),
         // The marker is purely structural; keep it out of layout/CSS flow.

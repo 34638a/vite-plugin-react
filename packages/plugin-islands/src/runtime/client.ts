@@ -8,6 +8,12 @@
  */
 import { createElement, type ComponentType } from 'react'
 import { createRoot, hydrateRoot, type Root } from 'react-dom/client'
+import {
+  browserEnv,
+  createScheduler,
+  observableTargets,
+  readConditions,
+} from './load'
 
 export type IslandRegistry = Record<
   string,
@@ -15,6 +21,10 @@ export type IslandRegistry = Record<
 >
 
 const MARKER = 'vite-island'
+
+const schedule = createScheduler(browserEnv)
+/** Markers already handed to the scheduler (a pending one has no data-hydrated yet). */
+const scheduled = new WeakSet<Element>()
 
 /**
  * Hydrates (or renders) one marker element. Never throws.
@@ -85,7 +95,11 @@ async function mountIsland(el: HTMLElement, registry: IslandRegistry) {
  * Hydrates every island under `root`.
  *
  * Safe to call more than once (e.g. after injecting HTML): already hydrated
- * markers are skipped.
+ * or scheduled markers are skipped.
+ *
+ * Each island loads on the conditions of its `data-on-*` attributes (see
+ * `./load`). The returned promise settles when the islands with no conditions
+ * have mounted; the others are only scheduled by then.
  */
 export function hydrateIslands(
   registry: IslandRegistry,
@@ -97,7 +111,20 @@ export function hydrateIslands(
     // Islands nested in another island are rendered by the outer island's
     // React tree; mounting a second root on them would fight React.
     if (el.parentElement?.closest(MARKER)) continue
-    jobs.push(mountIsland(el, registry))
+    // Conditional islands are scheduled, not awaited: a `visible` one may never load.
+    if (scheduled.has(el)) continue
+    scheduled.add(el)
+    const { conditions, any } = readConditions(el.dataset)
+    const watches = conditions.some(
+      (c) => c.on === 'visible' || c.on === 'interaction',
+    )
+    const job = schedule(
+      conditions,
+      any,
+      { marker: el, targets: watches ? observableTargets(el) : [] },
+      () => mountIsland(el, registry),
+    )
+    if (job) jobs.push(job)
   }
   return Promise.all(jobs)
 }
