@@ -22,6 +22,9 @@ export type IslandRegistry = Record<
 
 const MARKER = 'vite-island'
 
+/** Build ids already reported as not matching the islands entry. */
+const reportedBuilds = new Set<string>()
+
 const schedule = createScheduler(browserEnv)
 /** Markers already handed to the scheduler (a pending one has no data-hydrated yet). */
 const scheduled = new WeakSet<Element>()
@@ -46,6 +49,15 @@ async function mountIsland(el: HTMLElement, registry: IslandRegistry) {
     return
   }
 
+  // The island's `children`, server-rendered static HTML. Read before mounting
+  // (React clears the marker's children): from a client-rendered island's
+  // [data-island-slot] (an inert template, or the visible placeholder they
+  // double as) or from the slot inside a server-rendered one.
+  const slot =
+    el.querySelector<HTMLElement>(':scope > [data-island-slot]')?.innerHTML ??
+    [...el.querySelectorAll('vite-slot')].find((s) => s.closest(MARKER) === el)
+      ?.innerHTML
+
   let root: Root | undefined
   // One broken island must not take down the others on the page.
   const report = (what: string, error: unknown) =>
@@ -59,7 +71,21 @@ async function mountIsland(el: HTMLElement, registry: IslandRegistry) {
     }
     const start = (mode: string | undefined): Root => {
       const props = el.dataset.props ? JSON.parse(el.dataset.props) : {}
-      const element = createElement(Component, props)
+      const element = createElement(
+        Component,
+        slot === undefined
+          ? props
+          : {
+              ...props,
+              // The same element the server rendered, whose content React must
+              // not diff: it is HTML the page already holds.
+              children: createElement('vite-slot', {
+                suppressHydrationWarning: true,
+                style: { display: 'contents' },
+                dangerouslySetInnerHTML: { __html: slot },
+              }),
+            },
+      )
       if (mode === 'ssr') {
         // Server markup exists inside the marker: attach to it.
         return hydrateRoot(el, element)
@@ -92,6 +118,25 @@ async function mountIsland(el: HTMLElement, registry: IslandRegistry) {
 }
 
 /**
+ * A marker stamped with another build than the islands entry means the cached
+ * entry (or the cached HTML) is out of date: islands may be missing from the
+ * registry or not match the markup. Say so once per build instead of leaving
+ * inert islands to explain themselves.
+ */
+function warnIfStale(el: HTMLElement, build: string | null | undefined) {
+  const pageBuild = el.dataset.build
+  if (!build || !pageBuild || pageBuild === build) return
+  if (reportedBuilds.has(pageBuild)) return
+  reportedBuilds.add(pageBuild)
+  console.warn(
+    `[islands] this page's HTML was built for islands build "${pageBuild}" but ` +
+      `the islands entry is build "${build}". One of them is stale (cached): ` +
+      `serve the entry with a content hash or revalidation. Islands may not ` +
+      `hydrate until they match.`,
+  )
+}
+
+/**
  * Hydrates every island under `root`.
  *
  * Safe to call more than once (e.g. after injecting HTML): already hydrated
@@ -104,6 +149,7 @@ async function mountIsland(el: HTMLElement, registry: IslandRegistry) {
 export function hydrateIslands(
   registry: IslandRegistry,
   root: ParentNode = document,
+  options: { build?: string | null } = {},
 ): Promise<void[]> {
   const jobs: Promise<void>[] = []
   for (const el of root.querySelectorAll<HTMLElement>(MARKER)) {
@@ -111,6 +157,7 @@ export function hydrateIslands(
     // Islands nested in another island are rendered by the outer island's
     // React tree; mounting a second root on them would fight React.
     if (el.parentElement?.closest(MARKER)) continue
+    warnIfStale(el, options.build)
     // Conditional islands are scheduled, not awaited: a `visible` one may never load.
     if (scheduled.has(el)) continue
     scheduled.add(el)

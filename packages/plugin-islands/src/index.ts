@@ -39,8 +39,12 @@ import {
   type ResolvedConfig,
   type ViteDevServer,
 } from 'vite'
+import { revalidateOptimizedDeps } from './devDeps'
 import { rewriteRefreshSelfImport } from './refresh'
-import { islandId, scanIslands } from './scan'
+import type { IslandOn } from './runtime/load'
+import { buildIdOf, islandId, scanIslands } from './scan'
+
+export type { IslandOn }
 
 export interface IslandsOptions {
   /**
@@ -67,6 +71,27 @@ export interface IslandsOptions {
    * client only, since the server has no value to render.
    */
   tokenEncoder?: string
+  /**
+   * Default loading conditions (`onIdle`, `onVisible`, ...) for the islands of a
+   * file, so a component can say how it should load wherever it is used. A
+   * call's own `on*` props win. Evaluated at build time.
+   * @param file absolute path of the `"use client"` module
+   */
+  defaultOn?: (file: string) => IslandOn | undefined
+  /**
+   * Identifies the build for the client's staleness check. Production markers
+   * carry it, as does the islands entry; a page whose HTML names another build
+   * than its (cached) entry logs a warning. Default: a hash of every island's
+   * source. Set it (a release id, a git sha) to cover code the islands import.
+   */
+  buildId?: string
+  /**
+   * Keep Vite's `immutable` caching for pre-bundled dependencies in dev.
+   * Off by default: browsers then revalidate them, so a dependency re-optimized
+   * under the same hash can never be served stale.
+   * @default false
+   */
+  immutableDevDeps?: boolean
 }
 
 const PKG = '@vitejs/plugin-islands'
@@ -93,12 +118,18 @@ export function islands(options: IslandsOptions = {}): Plugin[] {
   let server: ViteDevServer | undefined
   /** island id -> absolute module path; the single source of truth. */
   let registry = new Map<string, string>()
+  /** Identifies the production build (see `buildId`); dev has none, as islands change under it. A production run counts even on a dev-style server (HBX renders its templates on one). */
+  let build: string | undefined
   let scanned: Promise<void> | undefined
 
   const rescan = () =>
     (scanned = scanIslands({ root: config.root, include, exclude }).then(
-      (m) => {
+      async (m) => {
         registry = m
+        build =
+          config.command === 'build' || config.isProduction
+            ? (options.buildId ?? (await buildIdOf(m)))
+            : undefined
       },
     ))
   const ensureScanned = () => scanned ?? rescan()
@@ -120,7 +151,8 @@ export function islands(options: IslandsOptions = {}): Plugin[] {
       const specifier = rel.startsWith('..') ? file : '/' + rel
       return `  ${JSON.stringify(id)}: () => import(${JSON.stringify(specifier)}),`
     })
-    return `export default {\n${rows.join('\n')}\n}\n`
+    // `null` in dev, where the HTML and the entry always come from one server.
+    return `export const build = ${JSON.stringify(build ?? null)}\nexport default {\n${rows.join('\n')}\n}\n`
   }
 
   /** ESTree `Literal` types omit `start`, but oxc-parsed nodes always carry it. */
@@ -151,6 +183,8 @@ export function islands(options: IslandsOptions = {}): Plugin[] {
 
       async configureServer(devServer) {
         server = devServer
+        if (!options.immutableDevDeps)
+          server.middlewares.use(revalidateOptimizedDeps)
         await ensureScanned()
 
         // Keep the registry current while developing. Adds/removes always
@@ -197,15 +231,15 @@ export function islands(options: IslandsOptions = {}): Plugin[] {
             ...(config.command === 'serve' && hasReactPreamble(config)
               ? [`import ${JSON.stringify(REACT_PREAMBLE)}`]
               : []),
-            `import registry from ${JSON.stringify(VIRTUAL_REGISTRY)}`,
+            `import registry, { build } from ${JSON.stringify(VIRTUAL_REGISTRY)}`,
             `import { hydrateIslands } from ${JSON.stringify(PKG + '/runtime/client')}`,
-            `export { hydrateIslands, registry }`,
+            `export { hydrateIslands, registry, build }`,
             // Module scripts are deferred, so the DOM is already parsed;
             // the readyState check covers inline/async usage too.
             `if (document.readyState === 'loading') {`,
-            `  document.addEventListener('DOMContentLoaded', () => hydrateIslands(registry), { once: true })`,
+            `  document.addEventListener('DOMContentLoaded', () => hydrateIslands(registry, document, { build }), { once: true })`,
             `} else {`,
-            `  hydrateIslands(registry)`,
+            `  hydrateIslands(registry, document, { build })`,
             `}`,
           ].join('\n')
         }
@@ -245,9 +279,15 @@ export function islands(options: IslandsOptions = {}): Plugin[] {
           }
 
           const hydrate = !options.clientOnly?.(file)
+          const defaults = options.defaultOn?.(file)
+          const extras = [
+            options.tokenEncoder && 'encoder: $$tokenEncoder',
+            defaults && `defaultOn: ${JSON.stringify(defaults)}`,
+            build && `build: ${JSON.stringify(build)}`,
+          ].filter(Boolean)
           const result = transformWrapExport(code, ast, {
             runtime: (value, name) =>
-              `$$islands.wrap(${value}, ${JSON.stringify(id)}, ${JSON.stringify(name)}, ${hydrate}${options.tokenEncoder ? ', $$tokenEncoder' : ''})`,
+              `$$islands.wrap(${value}, ${JSON.stringify(id)}, ${JSON.stringify(name)}, ${hydrate}${extras.length ? `, { ${extras.join(', ')} }` : ''})`,
           })
           result.output.prepend(
             `import * as $$islands from ${JSON.stringify(PKG + '/runtime/server')};\n` +

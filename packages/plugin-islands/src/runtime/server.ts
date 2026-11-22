@@ -27,7 +27,10 @@ import {
   type ComponentType,
   type ReactNode,
 } from 'react'
-import { splitOnProps } from './load'
+import { splitOnProps, type IslandOn } from './load'
+import { NOSCRIPT_CSS } from './noscript'
+
+export { NOSCRIPT_CSS }
 
 /**
  * True while rendering *inside* an island's server markup.
@@ -93,13 +96,6 @@ export function serializeProps(
   label: string,
   encoder?: TokenEncoder,
 ): string {
-  if (props.children != null) {
-    throw new Error(
-      `[islands] <${label}> received \`children\`. React elements cannot be ` +
-        `serialized into the HTML marker, so islands do not support children ` +
-        `yet. Pass data as props instead.`,
-    )
-  }
   // Tokens cannot be JSON; each is swapped for a sentinel string, then the
   // quoted sentinel is replaced by the host's encoding of that token.
   const tokens: string[] = []
@@ -193,9 +189,7 @@ export interface IslandFallback {
   noscript?: ReactNode
 }
 
-function fallbackNodes(fallback: IslandFallback | undefined): ReactNode {
-  if (!fallback) return null
-  const { placeholder, noscript } = fallback
+function fallbackNodes({ placeholder, noscript }: IslandFallback): ReactNode {
   return [
     placeholder != null &&
       createElement(
@@ -224,6 +218,30 @@ function containsToken(value: unknown, encoder: TokenEncoder): boolean {
   return false
 }
 
+/** What the plugin's options add to each wrapped island. */
+export interface WrapExtras {
+  /** Handles props that are placeholders resolved later (see `TokenEncoder`). */
+  encoder?: TokenEncoder
+  /** This file's default loading conditions; a call's own `on*` props win. */
+  defaultOn?: IslandOn
+  /** Identifies the build the registry was made from; the client compares it. */
+  build?: string
+}
+
+/**
+ * Static content passed to an island as `children`. It is server-rendered into
+ * the marker and handed to the component as a slot that the browser re-attaches
+ * from the same HTML, so it never goes through React on the client: no tokens
+ * resolved later in it, no interactivity.
+ */
+function Slot({ children }: { children?: ReactNode }): ReactNode {
+  return createElement(
+    'vite-slot',
+    { suppressHydrationWarning: true, style: { display: 'contents' } },
+    children,
+  )
+}
+
 /**
  * Called by plugin-generated code, once per export of every `"use client"`
  * module, in the SSR environment only.
@@ -241,9 +259,10 @@ export function wrap<T>(
   id: string,
   exportName: string,
   hydrate: boolean,
-  encoder?: TokenEncoder,
+  extras: WrapExtras = {},
 ): T {
   if (!isComponent(value, exportName)) return value
+  const { encoder, defaultOn, build } = extras
 
   const Original = value as unknown as ComponentType<any>
   const label =
@@ -252,18 +271,62 @@ export function wrap<T>(
       : exportName
 
   function Island(allProps: Record<string, unknown>): ReactNode {
-    const { fallback, ...withOn } = allProps as {
+    const {
+      fallback,
+      children,
+      slotAsFallback,
+      slotAsNoScript,
+      fallbackAsNoScript,
+      ...withOn
+    } = allProps as {
       fallback?: IslandFallback
+      children?: ReactNode
+      slotAsFallback?: boolean
+      slotAsNoScript?: boolean
+      fallbackAsNoScript?: boolean
     } & Record<string, unknown>
-    // The loading conditions (onVisible, onIdle, ...) are for the marker, not the component.
-    const { rest: props, attrs: onAttrs } = splitOnProps(withOn, label)
+    for (const [name, value] of Object.entries({
+      slotAsFallback,
+      slotAsNoScript,
+      fallbackAsNoScript,
+    })) {
+      if (value != null && typeof value !== 'boolean')
+        throw new Error(
+          `[islands] <${label}> ${name} must be true or false, got ` +
+            `${JSON.stringify(value)}.`,
+        )
+    }
+    // The loading conditions (onVisible, onIdle, ...) are for the marker, not
+    // the component; the file's defaults apply unless the call says otherwise.
+    const { rest: props, attrs: onAttrs } = splitOnProps(
+      { ...defaultOn, ...withOn },
+      label,
+    )
     // Nested client component: the outer island already owns this subtree.
-    if (useContext(InsideIsland)) return createElement(Original, props)
+    if (useContext(InsideIsland))
+      return createElement(
+        Original,
+        children != null ? { ...props, children } : props,
+      )
 
     // Tokens only have values in the browser, so the server cannot render them.
     const hasToken =
       !!encoder && Object.values(props).some((v) => containsToken(v, encoder))
     const ssr = hydrate && !hasToken
+
+    // The children are the visible placeholder when nothing else is.
+    const slotIsPlaceholder =
+      children != null && fallback == null && slotAsFallback !== false
+    // What a visitor with scripts off gets instead of an island that will
+    // never load: the call's own, else the children (already visible when they
+    // are the placeholder, so nothing to add), else a copy of the placeholder.
+    const noscript: ReactNode =
+      fallback?.noscript ??
+      (slotAsNoScript && children != null && !slotIsPlaceholder
+        ? children
+        : fallbackAsNoScript
+          ? fallback?.placeholder
+          : undefined)
 
     return createElement(
       'vite-island',
@@ -273,8 +336,11 @@ export function wrap<T>(
         'data-props': serializeProps(props, label, encoder),
         'data-hydrate': ssr ? 'ssr' : 'client',
         ...onAttrs,
+        ...(build ? { 'data-build': build } : {}),
         // `pending` until the client mounts the island, then `ready`.
         ...(ssr ? {} : { 'data-state': 'pending' }),
+        // Lets CSS hide the placeholders when scripts are off (see NOSCRIPT_CSS).
+        ...(!ssr && noscript != null ? { 'data-has-noscript': '' } : {}),
         // The marker is purely structural; keep it out of layout/CSS flow.
         style: { display: 'contents' },
       },
@@ -282,9 +348,37 @@ export function wrap<T>(
         ? createElement(
             InsideIsland.Provider,
             { value: true },
-            createElement(Original, props),
+            createElement(
+              Original,
+              children != null
+                ? { ...props, children: createElement(Slot, null, children) }
+                : props,
+            ),
           )
-        : fallbackNodes(fallback),
+        : [
+            fallbackNodes({ placeholder: fallback?.placeholder, noscript }),
+            children != null &&
+              // With no fallback of its own the children ARE the placeholder:
+              // visible from first paint (and with scripts off), cleared when
+              // the island mounts. Otherwise they wait, inert, in a template.
+              // Either way the client reads them from [data-island-slot].
+              (slotIsPlaceholder
+                ? createElement(
+                    'span',
+                    {
+                      key: 'slot',
+                      'data-island-placeholder': '',
+                      'data-island-slot': '',
+                      style: { display: 'contents' },
+                    },
+                    children,
+                  )
+                : createElement(
+                    'template',
+                    { key: 'slot', 'data-island-slot': '' },
+                    children,
+                  )),
+          ],
     )
   }
   Island.displayName = `Island(${label})`

@@ -4,6 +4,8 @@
 declare module 'virtual:islands/registry' {
   /** island id -> lazy loader for that island's client module */
   const registry: Record<string, () => Promise<Record<string, unknown>>>
+  /** Identifies the production build; `null` in dev. */
+  export const build: string | null
   export default registry
 }
 
@@ -13,8 +15,10 @@ declare module 'virtual:islands/client' {
   export function hydrateIslands(
     registry: IslandRegistry,
     root?: ParentNode,
+    options?: { build?: string | null },
   ): Promise<void[]>
   export const registry: IslandRegistry
+  export const build: string | null
 }
 
 // Custom element emitted by the SSR runtime.

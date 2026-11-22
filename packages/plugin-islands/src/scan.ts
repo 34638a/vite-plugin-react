@@ -65,3 +65,22 @@ export async function scanIslands(options: {
   // Deterministic ordering => reproducible chunk graph / registry output.
   return new Map([...islands].sort(([a], [b]) => a.localeCompare(b)))
 }
+
+/**
+ * Identifies the set of island modules a page's HTML and its islands entry were
+ * built from: a short hash of every island's id and source. Two builds of the
+ * same sources (the SSR build and the client build) get the same id, so the
+ * browser can tell when a cached entry no longer matches the HTML it hydrates.
+ * Code an island only imports is not covered; pass `buildId` to cover more.
+ */
+export async function buildIdOf(
+  registry: Map<string, string>,
+): Promise<string> {
+  const hash = createHash('sha256')
+  const entries = [...registry].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  for (const [id, file] of entries) {
+    hash.update(id)
+    hash.update(await fs.promises.readFile(file))
+  }
+  return hash.digest('hex').slice(0, 8)
+}

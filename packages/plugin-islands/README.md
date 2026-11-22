@@ -76,12 +76,15 @@ marker.
 
 ## Options
 
-| Option         | Default                        | Purpose                                                                                                                                                                                                                                                                    |
-| -------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `include`      | `['src/**/*.{js,jsx,ts,tsx}']` | Where to look for `"use client"` modules. Only matched files can hydrate (the client registry comes from this scan, so client build doesn't depend on SSR build order).                                                                                                    |
-| `exclude`      | node_modules, `.d.ts`, tests   | Ignored paths.                                                                                                                                                                                                                                                             |
-| `clientOnly`   | none                           | `(file) => boolean`. Skip SSR for islands that touch `window` while rendering; client renders them from scratch.                                                                                                                                                           |
-| `tokenEncoder` | none                           | Module specifier whose default export is `{ isToken(v), encode(v) }`. A host (e.g. a template engine) passes props that are placeholders resolved later; `encode` returns the JSON fragment spliced into `data-props`. An island with such a prop is client-rendered only. |
+| Option             | Default                        | Purpose                                                                                                                                                                                                                                                                    |
+| ------------------ | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `include`          | `['src/**/*.{js,jsx,ts,tsx}']` | Where to look for `"use client"` modules. Only matched files can hydrate (the client registry comes from this scan, so client build doesn't depend on SSR build order).                                                                                                    |
+| `exclude`          | node_modules, `.d.ts`, tests   | Ignored paths.                                                                                                                                                                                                                                                             |
+| `clientOnly`       | none                           | `(file) => boolean`. Skip SSR for islands that touch `window` while rendering; client renders them from scratch.                                                                                                                                                           |
+| `tokenEncoder`     | none                           | Module specifier whose default export is `{ isToken(v), encode(v) }`. A host (e.g. a template engine) passes props that are placeholders resolved later; `encode` returns the JSON fragment spliced into `data-props`. An island with such a prop is client-rendered only. |
+| `defaultOn`        | none                           | `(file) => IslandOn \| undefined`. Default loading conditions (`onIdle`, `onVisible`, ...) for the islands of a file, so a component says how it loads wherever it is used. A call's own `on*` props win; a call can switch a default off with `false`.                    |
+| `buildId`          | hash of the island sources     | Identifies the build for the staleness check (see "Caching"). Set a release id or git sha to cover code the islands only import.                                                                                                                                           |
+| `immutableDevDeps` | `false`                        | Keep Vite's `immutable` caching of pre-bundled dependencies in dev (see "Caching").                                                                                                                                                                                        |
 
 ## When an island loads (`on*` props)
 
@@ -145,8 +148,8 @@ mounts. Pass the reserved `fallback` prop to fill it:
   marker's place in case the viewport sees it before the island's code has
   loaded. React replaces it when the island mounts.
 - `noscript`: "this island will never render, scripts are off". Inside
-  `<noscript>`. The placeholder is still visible with scripts off too; hide it
-  with CSS on `[data-island-placeholder]` if that matters.
+  `<noscript>`. With the head style below, the placeholder is hidden when
+  scripts are off and this shows in its place.
 
 There is no failed state. What an island shows when it breaks is the
 component's own business (give it an error boundary). If an island's module
@@ -158,6 +161,53 @@ server-rendered island has its real markup already, so it takes none.
 The marker's `data-state` is `pending` on a client-rendered island until it
 mounts, then `ready`.
 
+### No-JS content from the children or the placeholder
+
+Without `fallback.noscript`, two call-site props can supply the no-JS content
+(both default to `false`):
+
+- `slotAsNoScript`: the **children** are the no-JS content. Useful when
+  something else is the placeholder (a `fallback`, or `slotAsFallback={false}`),
+  which would otherwise leave scripts-off visitors without the children. When
+  the children are already the visible placeholder there is nothing to add, so
+  nothing is duplicated.
+- `fallbackAsNoScript`: a copy of the custom `fallback.placeholder` is the no-JS
+  content, so it still shows once the placeholder itself is hidden.
+
+Precedence: an explicit `fallback.noscript`, then the children
+(`slotAsNoScript`), then the placeholder (`fallbackAsNoScript`). A
+server-rendered island takes none of it.
+
+### The head style
+
+An island that has no-JS content, from any of the three sources, carries
+`data-has-noscript` on its marker. Add this rule where scripts-off styles belong,
+the end of `<head>`:
+
+```html
+<noscript
+  ><style>
+    vite-island[data-has-noscript] > [data-island-placeholder] {
+      display: none !important;
+    }
+  </style></noscript
+>
+```
+
+It is exported as `NOSCRIPT_CSS` from `@vitejs/plugin-islands/runtime/server`, so
+the selector stays next to the markup it targets. The shape it relies on:
+
+- the placeholder is a **direct child** of the marker, whether it came from
+  `fallback.placeholder` or is the children shown as one; both carry
+  `data-island-placeholder`;
+- `!important` is needed: the placeholder wrapper has an inline
+  `display: contents`.
+
+With scripts on, the `<noscript>` is inert, so the rule never applies and the
+placeholder shows until the island mounts. With no no-JS content, the
+placeholder stays visible with scripts off (a children placeholder is then all
+the visitor gets, which is the point of `slotAsFallback`).
+
 ## Development
 
 - **Fast Refresh in place.** In dev the client entry installs
@@ -168,13 +218,60 @@ mounts, then `ready`.
 - **Restart on new props.** If a marker's `data-props` changes, its island is
   unmounted and mounted again with fresh state and the new props.
 
+## Children (static slot)
+
+An island may take `children`. They are rendered once, on the server, into the
+marker, and the component receives them as a slot that the browser re-attaches
+from the same HTML. They never go through React on the client, so they are
+**static**: no interactivity inside the slot, and nothing in it that only
+resolves in the browser.
+
+```tsx
+<Card title="Hello">
+  <p>Server-rendered, static.</p>
+</Card>
+```
+
+- A server-rendered island renders its children in place (inside a
+  `<vite-slot>`).
+- **A client-rendered island shows its children as its placeholder.** With no
+  `fallback` of its own, the children are visible from first paint (and with
+  scripts off, where they are all the visitor gets), inside
+  `<span data-island-placeholder data-island-slot>`. When the island mounts the
+  placeholder is cleared and the component receives the same content as its
+  slot, so nothing is lost. Turn this off with `slotAsFallback={false}`, or by
+  passing any `fallback`: the children then wait, hidden, in
+  `<template data-island-slot>` until the island mounts.
+- With a host that fills template values after rendering (such as HBX's
+  `{{...}}`), those are filled in already when the browser reads the slot.
+- `children` are not part of `data-props`. Pass anything dynamic as props.
+
+## Caching
+
+- **Production.** Vite content-hashes the island chunks, so a new deploy gets new
+  chunk URLs. What can go stale is the islands **entry** itself when it has a
+  stable name: serve it with a content hash or revalidation. Every marker and the
+  entry carry the same build id (`data-build`, `build` from
+  `virtual:islands/client`); if cached HTML and a cached entry come from
+  different builds, the browser logs one warning naming both ids instead of
+  leaving inert islands unexplained. The id hashes the islands' sources; set
+  `buildId` to also cover what they import.
+- **Dev.** Vite serves pre-bundled dependencies as `immutable`. If the optimizer
+  re-runs under the same hash, a browser that already has the old file keeps it
+  and the page breaks far from the cause. The plugin makes the browser
+  revalidate those files (a local 304 each); `immutableDevDeps: true` turns that off.
+
 ## Rules and limitations
 
 - **Props must be JSON.** Functions, symbols, bigint, class instances and React
   elements throw at render time with the component name. `Date` becomes a
   string (JSON semantics).
-- **No `children` on islands (yet).** React elements can't be serialized into
-  an attribute; passing them throws a clear error.
+- **Reserved call-site props:** `fallback`, `slotAsFallback`, `slotAsNoScript`,
+  `fallbackAsNoScript` and the `on*`
+  loading conditions are read by the plugin and never reach the component, so a
+  component should not use those names for its own props.
+- **`children` are a static slot** (see "Children"): server-rendered HTML, not
+  React elements, so nothing in them is interactive.
 - **Nested client components** are fine: only the outermost one gets a marker.
 - **Only component exports become islands** (capitalised names, default
   exports, `memo`/`forwardRef`/`lazy`). Hooks, constants and helpers exported
